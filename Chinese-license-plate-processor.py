@@ -1,5 +1,8 @@
-import pandas as pd
 from pathlib import Path
+import re
+import unicodedata
+
+import pandas as pd
 
 # =====================================================================================
 # --- CONFIGURATION ZONE ---
@@ -10,13 +13,35 @@ CONFIG = {
     # The name of the column in your Excel file that contains the license plates.
     # e.g., "License Plate Number", "Plate ID", "车牌号"
     "input_column_name": "车牌号",
+    # Optional aliases for auto-detecting the plate column.
+    "input_column_aliases": ["车牌", "牌照", "License Plate", "Plate", "Plate Number"],
+    # Optional keywords for fuzzy matching if aliases fail.
+    "input_column_keywords": ["车牌", "牌照", "plate", "licenseplate"],
 
     # The names for the new columns that will be added to the Excel file.
     "output_province_column": "车牌归属地（省）",
     "output_city_column": "车牌归属地（市）",
 
     # The name of the folder where the processed files will be saved.
-    "output_folder_name": "处理后表格"
+    "output_folder_name": "处理后表格",
+
+    # Batch input settings.
+    # "input_paths" can include files, folders, or glob patterns (e.g., "*.xlsx").
+    "input_paths": ["."],
+    # Whether to search subfolders of input directories.
+    "recursive_search": False,
+    # Whether to preserve other sheets when processing a workbook.
+    "preserve_other_sheets": True,
+    # Process all sheets when True, otherwise only the first sheet.
+    "process_all_sheets": False,
+    # Explicit sheet names to process. Leave empty to use the defaults above.
+    "sheet_names": [],
+    # Skip hidden files and directories (names starting with a dot).
+    "skip_hidden_files": True,
+    # Overwrite existing output columns if they already exist.
+    "overwrite_existing_output_columns": True,
+    # Skip output if no sheet contains the target column.
+    "skip_files_without_column": True,
 }
 
 # =====================================================================================
@@ -188,19 +213,336 @@ PROVINCE_MAP = {
 # No need to modify anything below this line for normal use.
 # =====================================================================================
 
-def get_location_parts(plate_number):
-    """
-    Looks up the location for a given license plate number based on its prefix.
-    Returns a tuple of (province, city).
-    """
-    if not isinstance(plate_number, str) or len(plate_number) < 2:
-        return '未知', '未知'
-    
-    prefix = plate_number[:2]
-    location_full = PROVINCE_MAP.get(prefix, '未知-未知')
-    
-    parts = location_full.split('-', 1)
-    return (parts[0], parts[1]) if len(parts) == 2 else (parts[0], parts[0])
+SUPPORTED_EXTENSIONS = {".xlsx", ".xls"}
+PLATE_CLEAN_PATTERN = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]")
+
+
+def normalize_column_name(name):
+    return re.sub(r"[\s\-_]+", "", str(name)).lower()
+
+
+def resolve_input_column(columns, config):
+    normalized_map = {}
+    for col in columns:
+        normalized_map.setdefault(normalize_column_name(col), []).append(col)
+
+    candidates = [config.get("input_column_name")] + list(config.get("input_column_aliases", []))
+    for candidate in candidates:
+        if not candidate:
+            continue
+        normalized = normalize_column_name(candidate)
+        if normalized in normalized_map:
+            matches = normalized_map[normalized]
+            if len(matches) > 1:
+                print(f"  -> WARNING: Multiple columns match '{candidate}', using '{matches[0]}'.")
+            elif candidate != config.get("input_column_name"):
+                print(f"  -> INFO: Column '{matches[0]}' matched via alias '{candidate}'.")
+            return matches[0]
+
+    keywords = [normalize_column_name(keyword) for keyword in config.get("input_column_keywords", []) if keyword]
+    if keywords:
+        keyword_matches = [
+            col
+            for col in columns
+            if any(keyword in normalize_column_name(col) for keyword in keywords)
+        ]
+        if len(keyword_matches) == 1:
+            print(f"  -> INFO: Column '{keyword_matches[0]}' matched via keyword.")
+            return keyword_matches[0]
+        if len(keyword_matches) > 1:
+            print("  -> WARNING: Multiple columns matched keywords; please set 'input_column_name'.")
+
+    return None
+
+
+def normalize_plate_series(series):
+    cleaned = series.astype("string")
+    cleaned = cleaned.map(
+        lambda value: unicodedata.normalize("NFKC", value) if isinstance(value, str) else value
+    )
+    cleaned = cleaned.str.strip()
+    cleaned = cleaned.str.replace(PLATE_CLEAN_PATTERN, "", regex=True)
+    cleaned = cleaned.str.upper()
+    return cleaned
+
+
+def build_location_columns(series):
+    cleaned = normalize_plate_series(series)
+    lengths = cleaned.str.len().fillna(0)
+    prefix = cleaned.str.slice(0, 2)
+    prefix = prefix.where(lengths >= 2, "")
+    location = prefix.map(PROVINCE_MAP).fillna("未知-未知")
+    parts = location.str.split("-", n=1, expand=True)
+    province = parts[0].fillna("未知")
+    city = parts[1].fillna(parts[0]).fillna("未知")
+    return province, city
+
+
+def make_unique_column_name(desired_name, existing_columns, reserved_columns, allow_overwrite):
+    if allow_overwrite and desired_name not in reserved_columns:
+        return desired_name
+
+    candidate = desired_name
+    if candidate in existing_columns or candidate in reserved_columns:
+        suffix = " (new)"
+        candidate = f"{desired_name}{suffix}"
+        counter = 2
+        while candidate in existing_columns or candidate in reserved_columns:
+            candidate = f"{desired_name}{suffix} {counter}"
+            counter += 1
+    return candidate
+
+
+def reorder_columns(df, input_col, new_cols):
+    cols = list(df.columns)
+    for col in new_cols:
+        cols = [existing for existing in cols if existing != col]
+    try:
+        insert_at = cols.index(input_col)
+    except ValueError:
+        insert_at = len(cols)
+    final_cols = cols[:insert_at] + list(new_cols) + cols[insert_at:]
+    return df[final_cols]
+
+
+def get_reader_engine(file_path):
+    suffix = file_path.suffix.lower()
+    if suffix == ".xlsx":
+        return "openpyxl"
+    if suffix == ".xls":
+        return "xlrd"
+    return None
+
+
+def resolve_output_path(file_path, output_dir, current_dir):
+    suffix = file_path.suffix.lower()
+    output_suffix = suffix
+    writer_engine = "openpyxl"
+    warning = None
+
+    if suffix == ".xls":
+        try:
+            import xlwt  # noqa: F401
+        except Exception:
+            output_suffix = ".xlsx"
+            writer_engine = "openpyxl"
+            warning = "xlwt is not installed; saving .xls as .xlsx instead."
+        else:
+            writer_engine = "xlwt"
+    elif suffix == ".xlsx":
+        writer_engine = "openpyxl"
+    else:
+        output_suffix = ".xlsx"
+        warning = f"Unsupported extension '{suffix}', saving as .xlsx."
+
+    try:
+        relative_path = file_path.resolve().relative_to(current_dir.resolve())
+        output_subdir = relative_path.parent
+    except ValueError:
+        safe_parts = [
+            part for part in file_path.resolve().parent.parts if part not in (file_path.anchor, "")
+        ]
+        output_subdir = Path("external") / Path(*safe_parts)
+
+    output_folder = output_dir / output_subdir
+    output_folder.mkdir(parents=True, exist_ok=True)
+    output_path = output_folder / f"{file_path.stem}{output_suffix}"
+    return output_path, writer_engine, warning
+
+
+def is_supported_file(file_path, output_dir, skip_hidden):
+    if skip_hidden and any(part.startswith(".") for part in file_path.parts):
+        return False
+
+    try:
+        resolved_path = file_path.resolve()
+    except FileNotFoundError:
+        resolved_path = file_path
+
+    if output_dir and (output_dir == resolved_path or output_dir in resolved_path.parents):
+        return False
+
+    return file_path.suffix.lower() in SUPPORTED_EXTENSIONS
+
+
+def collect_excel_files(input_paths, output_dir, recursive, skip_hidden):
+    current_dir = Path.cwd()
+    output_dir_resolved = output_dir.resolve()
+    seen = set()
+    files = []
+
+    for raw_path in input_paths:
+        if raw_path is None:
+            continue
+        raw_path = str(raw_path)
+        if not raw_path:
+            continue
+        if any(char in raw_path for char in ["*", "?", "["]):
+            path = Path(raw_path)
+            if path.is_absolute():
+                base = Path(path.anchor)
+                pattern = str(path.relative_to(path.anchor))
+                candidates = list(base.glob(pattern))
+            else:
+                candidates = list(current_dir.glob(raw_path))
+        else:
+            path = Path(raw_path)
+            if not path.is_absolute():
+                path = current_dir / path
+            candidates = [path]
+
+        for candidate in candidates:
+            if not candidate.exists():
+                print(f"  -> WARNING: Input path not found: {candidate}")
+                continue
+            if candidate.is_dir():
+                iterator = candidate.rglob("*") if recursive else candidate.glob("*")
+                for file_path in iterator:
+                    if not file_path.is_file():
+                        continue
+                    if not is_supported_file(file_path, output_dir_resolved, skip_hidden):
+                        continue
+                    resolved = file_path.resolve()
+                    if resolved in seen:
+                        continue
+                    seen.add(resolved)
+                    files.append(file_path)
+            elif candidate.is_file():
+                if not is_supported_file(candidate, output_dir_resolved, skip_hidden):
+                    continue
+                resolved = candidate.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                files.append(candidate)
+
+    return sorted(files, key=lambda path: str(path).lower())
+
+
+def select_sheet_names(all_sheet_names, config):
+    explicit = [name for name in config.get("sheet_names") or [] if name]
+    if explicit:
+        matched = [name for name in explicit if name in all_sheet_names]
+        missing = [name for name in explicit if name not in all_sheet_names]
+        if missing:
+            print(f"  -> WARNING: Sheet(s) not found: {', '.join(missing)}")
+        return matched
+
+    if config.get("process_all_sheets"):
+        return list(all_sheet_names)
+
+    return all_sheet_names[:1]
+
+
+def format_display_path(path, base_dir):
+    try:
+        return str(path.relative_to(base_dir))
+    except ValueError:
+        return str(path)
+
+
+def process_dataframe(df, config, context_prefix=""):
+    input_col = resolve_input_column(df.columns, config)
+    if not input_col:
+        message = f"{context_prefix} SKIPPED: Column '{config['input_column_name']}' not found."
+        print(message.strip())
+        return df, False
+
+    existing_columns = list(df.columns)
+    reserved_columns = {input_col}
+    allow_overwrite = bool(config.get("overwrite_existing_output_columns", True))
+
+    prov_col = make_unique_column_name(
+        config["output_province_column"],
+        existing_columns,
+        reserved_columns,
+        allow_overwrite,
+    )
+    if prov_col != config["output_province_column"]:
+        print(
+            f"{context_prefix} WARNING: Output column '{config['output_province_column']}' exists; "
+            f"using '{prov_col}'."
+        )
+
+    reserved_columns.add(prov_col)
+    city_col = make_unique_column_name(
+        config["output_city_column"],
+        existing_columns + [prov_col],
+        reserved_columns,
+        allow_overwrite,
+    )
+    if city_col != config["output_city_column"]:
+        print(
+            f"{context_prefix} WARNING: Output column '{config['output_city_column']}' exists; "
+            f"using '{city_col}'."
+        )
+
+    province, city = build_location_columns(df[input_col])
+    df[prov_col] = province
+    df[city_col] = city
+    df = reorder_columns(df, input_col, [prov_col, city_col])
+    return df, True
+
+
+def write_excel_file(output_path, sheets, writer_engine):
+    with pd.ExcelWriter(output_path, engine=writer_engine) as writer:
+        for sheet_name, df in sheets.items():
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+
+def process_excel_file(file_path, output_dir, current_dir, config):
+    engine = get_reader_engine(file_path)
+    if engine is None:
+        print(f"  -> SKIPPED: Unsupported file type '{file_path.suffix}'.")
+        return "skipped"
+
+    try:
+        with pd.ExcelFile(file_path, engine=engine) as excel_file:
+            sheet_names = excel_file.sheet_names
+            if not sheet_names:
+                print("  -> SKIPPED: No sheets found.")
+                return "skipped"
+
+            target_sheet_names = select_sheet_names(sheet_names, config)
+            if not target_sheet_names:
+                print("  -> SKIPPED: No matching sheets found.")
+                return "skipped"
+
+            output_sheets = {}
+            processed_any = False
+            for sheet_name in sheet_names:
+                if not config.get("preserve_other_sheets", True) and sheet_name not in target_sheet_names:
+                    continue
+                df = excel_file.parse(sheet_name)
+                if sheet_name in target_sheet_names:
+                    context = f"  [Sheet: {sheet_name}]"
+                    df, processed = process_dataframe(df, config, context)
+                    processed_any = processed_any or processed
+                output_sheets[sheet_name] = df
+
+            if config.get("skip_files_without_column", True) and not processed_any:
+                print("  -> SKIPPED: Target column not found in selected sheets.")
+                return "skipped"
+
+            output_path, writer_engine, warning = resolve_output_path(
+                file_path,
+                output_dir,
+                current_dir,
+            )
+            if warning:
+                print(f"  -> WARNING: {warning}")
+
+            write_excel_file(output_path, output_sheets, writer_engine)
+            display_path = format_display_path(output_path, current_dir)
+            print(f"  -> SUCCESS: Saved to '{display_path}'")
+            return "processed"
+    except ImportError as e:
+        print(f"  -> ERROR: Missing dependency for '{file_path.name}': {e}")
+        return "error"
+    except Exception as e:
+        print(f"  -> ERROR: An unexpected error occurred: {e}")
+        return "error"
+
 
 def process_license_plates_in_directory():
     """
@@ -208,71 +550,56 @@ def process_license_plates_in_directory():
     """
     current_dir = Path.cwd()
     output_dir = current_dir / CONFIG["output_folder_name"]
-    output_dir.mkdir(exist_ok=True)
-    
-    print(f"Starting script...")
-    print(f"Looking for Excel files in: {current_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    input_paths = CONFIG.get("input_paths", ["."])
+    if isinstance(input_paths, (str, Path)):
+        input_paths = [str(input_paths)]
+
+    print("Starting script...")
+    print(f"Current directory: {current_dir}")
+    print(f"Input paths: {input_paths}")
+    print(f"Recursive search: {CONFIG.get('recursive_search', False)}")
     print(f"Processed files will be saved to: {output_dir}")
     print("-" * 30)
 
-    excel_files = list(current_dir.glob('*.xlsx')) + list(current_dir.glob('*.xls'))
+    excel_files = collect_excel_files(
+        input_paths,
+        output_dir,
+        recursive=CONFIG.get("recursive_search", False),
+        skip_hidden=CONFIG.get("skip_hidden_files", True),
+    )
 
     if not excel_files:
-        print("No Excel files (.xlsx or .xls) found in the current directory.")
+        print("No Excel files (.xlsx or .xls) found in the specified paths.")
         return
 
     processed_count = 0
+    skipped_count = 0
+    error_count = 0
+
     for file_path in excel_files:
-        print(f"Processing: {file_path.name}")
-        try:
-            engine = 'openpyxl' if file_path.suffix == '.xlsx' else 'xlrd'
-            df = pd.read_excel(file_path, engine=engine)
-
-            input_col = CONFIG["input_column_name"]
-            if input_col not in df.columns:
-                print(f"  -> SKIPPED: Column '{input_col}' not found in this file.")
-                continue
-
-            # Apply the location lookup function
-            location_data = df[input_col].apply(get_location_parts)
-            
-            # Create new columns from the returned tuples
-            prov_col = CONFIG["output_province_column"]
-            city_col = CONFIG["output_city_column"]
-            df[prov_col] = location_data.apply(lambda x: x[0])
-            df[city_col] = location_data.apply(lambda x: x[1])
-
-            # Reorder columns to place new columns before the input column
-            cols = list(df.columns)
-            # Remove the newly added columns to insert them at the correct position
-            cols.remove(prov_col)
-            cols.remove(city_col)
-            # Find the index of the original license plate column
-            try:
-                plate_col_index = cols.index(input_col)
-                # Insert the new columns right before it
-                final_cols = cols[:plate_col_index] + [prov_col, city_col] + cols[plate_col_index:]
-                df = df[final_cols]
-            except ValueError:
-                # This should not happen if we already checked for the column, but as a fallback:
-                df = df[[prov_col, city_col] + cols]
-
-            # Save the processed dataframe to the output directory
-            output_path = output_dir / file_path.name
-            df.to_excel(output_path, index=False)
-            print(f"  -> SUCCESS: Saved to '{output_path.relative_to(current_dir)}'")
+        display_path = format_display_path(file_path, current_dir)
+        print(f"Processing: {display_path}")
+        result = process_excel_file(file_path, output_dir, current_dir, CONFIG)
+        if result == "processed":
             processed_count += 1
+        elif result == "skipped":
+            skipped_count += 1
+        else:
+            error_count += 1
 
-        except Exception as e:
-            print(f"  -> ERROR: An unexpected error occurred: {e}")
-    
     print("-" * 30)
-    print(f"All files processed. {processed_count} file(s) were successfully updated.")
+    print(
+        "All files processed. "
+        f"{processed_count} updated, {skipped_count} skipped, {error_count} error(s)."
+    )
 
 if __name__ == '__main__':
     # --- How to use ---
     # 1. Install required libraries:
     #    pip install pandas openpyxl xlrd
+    #    (Optional for .xls output) pip install xlwt
     #
     # 2. Place this script in the same folder as your Excel files.
     #
