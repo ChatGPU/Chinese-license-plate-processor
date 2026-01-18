@@ -272,7 +272,7 @@ def build_location_columns(series):
     prefix = cleaned.str.slice(0, 2)
     prefix = prefix.where(lengths >= 2, "")
     location = prefix.map(PROVINCE_MAP).fillna("未知-未知")
-    parts = location.str.split("-", n=1, expand=True)
+    parts = location.str.split("-", n=1, expand=True).reindex(columns=[0, 1])
     province = parts[0].fillna("未知")
     city = parts[1].fillna(parts[0]).fillna("未知")
     return province, city
